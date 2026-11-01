@@ -13,6 +13,7 @@ It runs entirely on your server. Nothing is sent to outside services.
 **Contents**
 - Using it: [Upload page](#upload-page) · [API](#api) · [Calling it from PHP](#calling-it-from-the-front-service-php) · [Command line](#command-line-no-api)
 - Deploying it: [Setup](#setup-ubuntu--debian) · [Keep it internal](#keep-it-internal) · [Operations](#operations) · [Troubleshooting](#troubleshooting)
+- [License and third-party components](#license)
 
 ```
 other system ──POST audio+text──▶ PHP API ──job folder──▶ worker (Python)
@@ -392,3 +393,24 @@ vtt-aligner/
 - Job IDs are 128-bit random hex; anything else is rejected before touching the disk.
 - The worker runs as its own unprivileged user under systemd with a read-only filesystem except its storage folder.
 - There's no rate limiting beyond the queue limit; keep the service on a private network or behind your reverse proxy's limits.
+
+---
+
+## License
+
+Part of md-reader, released under the [MIT License](../../LICENSE).
+
+### Third-party components
+
+| Component | Used for | How it's used | License |
+|---|---|---|---|
+| [CMU PocketSphinx](https://github.com/cmusphinx/pocketsphinx) 5.1, including its US English acoustic model and the CMU Pronouncing Dictionary | Speech recognition with word timings | Python package installed by `pip` (`worker/requirements.txt`) and imported. Not included in this repository. | BSD-2-Clause (bundled parts under BSD-style licenses) |
+| [NumPy](https://numpy.org/) | Audio analysis (finding pauses) | Python package installed by `pip` and imported. Not included. | BSD-3-Clause (bundled parts: 0BSD, MIT, Zlib, CC0-1.0) |
+| [markdown-it-py](https://github.com/executablebooks/markdown-it-py), with its dependency [mdurl](https://github.com/executablebooks/mdurl) | Reading Markdown into sentences | Python packages installed by `pip` and imported. Not included. | MIT |
+| [espeak-ng](https://github.com/espeak-ng/espeak-ng) | Pronunciations for names and unusual words | System package installed by `apt`, run as a separate program. Not included. | GPL-3.0-or-later |
+| [FFmpeg](https://ffmpeg.org/) | Decoding uploaded audio | System package installed by `apt`, run as a separate program. Not included. | LGPL-2.1-or-later; Debian/Ubuntu builds are GPL-2.0-or-later |
+| sounddevice, cffi, pycparser | Nothing (installed automatically as PocketSphinx dependencies) | Python packages pulled in by `pip`; the aligner doesn't use them. | MIT, MIT, BSD-3-Clause |
+
+No third-party code is copied into this repository. The GPL-licensed tools (espeak-ng, FFmpeg) are installed separately and run as separate programs, so their licenses don't extend to this project's code. If you distribute a bundle that *includes* them, such as a Docker image, follow their licenses for those parts (for example, by making their source available).
+
+The software these run on (PHP, Python, nginx or Apache) is not part of this project.
