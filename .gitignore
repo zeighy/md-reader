@@ -1,0 +1,15 @@
+# Local configuration and environments
+utility/vtt-aligner/config.ini
+utility/vtt-aligner/venv/
+__pycache__/
+*.pyc
+
+# Your own documents. Uncomment to keep your content out of the repository
+# (the sample docs stay tracked until you delete them).
+# docs/*
+# !docs/.htaccess
+
+# OS / editor clutter
+.DS_Store
+Thumbs.db
+*.swp
