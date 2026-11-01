@@ -1,0 +1,2 @@
+# Documents are only served through api.php, which checks every path.
+Require all denied

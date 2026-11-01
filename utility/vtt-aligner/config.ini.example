@@ -1,0 +1,37 @@
+; vtt-aligner configuration. Copy to config.ini and edit.
+; Read by the PHP API and the Python worker. Keep it out of the web root and
+; readable by the web server and the worker.
+
+[service]
+; Where jobs are kept. Must be writable by both the web server and the worker,
+; and should NOT be inside the web root.
+storage_dir = /var/lib/vtt-aligner
+
+; Largest audio upload accepted, in MB. PHP's upload_max_filesize and
+; post_max_size (and nginx's client_max_body_size) must be at least this.
+max_upload_mb = 300
+
+; Largest text upload accepted, in KB.
+max_text_kb = 2048
+
+; Longest narration accepted, in minutes.
+max_audio_minutes = 240
+
+; Jobs waiting or running at once before new ones are refused (HTTP 503).
+max_queue = 20
+
+; Finished and failed jobs (and their .vtt) are deleted after this many hours.
+retention_hours = 72
+
+; Keep uploaded audio after a job finishes? (false saves disk space)
+keep_inputs = false
+
+[worker]
+; CPU cores to use for transcription (0 = all).
+cores = 0
+
+; A job running longer than this is stopped and marked failed.
+max_job_minutes = 60
+
+; How often an idle worker checks for new jobs, in seconds.
+poll_seconds = 2

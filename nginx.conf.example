@@ -1,0 +1,84 @@
+# nginx equivalent of the viewer's two .htaccess files.
+# Adjust server_name, root and fastcgi_pass, then include this from
+# /etc/nginx/sites-available/ (or conf.d/) and run: nginx -t && systemctl reload nginx
+
+server {
+    listen 80;
+    listen [::]:80;
+    # For HTTPS, swap the two lines above for:
+    #   listen 443 ssl;  listen [::]:443 ssl;  http2 on;
+    #   ssl_certificate     /etc/ssl/certs/your-cert.pem;
+    #   ssl_certificate_key /etc/ssl/private/your-key.pem;
+
+    server_name docs.example.com;
+    root /var/www/md-reader;           # folder containing index.php
+
+    # DirectoryIndex index.php
+    index index.php;
+
+    # Options -Indexes  (no directory listings)
+    autoindex off;
+
+    # mod_headers block. Kept at server level so every response gets them;
+    # don't add other add_header lines inside the locations below, or nginx
+    # drops these for that location.
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "same-origin" always;
+
+    # ---- Deny rules (the <FilesMatch> block and docs/.htaccess) ----------
+    # Answering 404 rather than 403 so nothing confirms the files exist.
+
+    # Dotfiles and dot-folders anywhere: .htaccess, .git, .env ...
+    # (.well-known stays open so Let's Encrypt renewals keep working.)
+    location ~ /\.(?!well-known/) {
+        return 404;
+    }
+
+    # utility/ holds separate tools (e.g. vtt-aligner) with their own deployment;
+    # never serve or run them from the viewer's site.
+    location ^~ /utility/ {
+        return 404;
+    }
+
+    # docs/.htaccess "Require all denied": documents only go out through api.php.
+    # ^~ stops nginx checking any regex location for these URLs.
+    location ^~ /docs/ {
+        return 404;
+    }
+
+    # Include-only PHP files.
+    location ~ ^/(lib|config)\.php$ {
+        return 404;
+    }
+
+    # Markdown, logs, backups, editor swap files, ini/lock/json, *.example.
+    location ~* \.(md|markdown|log|bak|swp|ini|lock|json|example)$ {
+        return 404;
+    }
+
+    # ---- PHP --------------------------------------------------------------
+    # Only the two real entry points are executed.
+    location ~ ^/(index|api)\.php$ {
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        # Match your PHP version: `ls /run/php/` shows the socket name.
+        # A wrong name gives "502 Bad Gateway".
+        fastcgi_pass unix:/run/php/php8.3-fpm.sock;   # or 127.0.0.1:9000
+        fastcgi_hide_header X-Powered-By;              # Header always unset X-Powered-By
+        # PHP sends these too; drop its copies so each appears once.
+        fastcgi_hide_header X-Content-Type-Options;
+        fastcgi_hide_header X-Frame-Options;
+        fastcgi_hide_header Referrer-Policy;
+    }
+
+    # Any other .php file is never run or served as source.
+    location ~ \.php$ {
+        return 404;
+    }
+
+    # ---- Everything else (app.js, style.css) -----------------------------
+    location / {
+        try_files $uri $uri/ =404;
+    }
+}

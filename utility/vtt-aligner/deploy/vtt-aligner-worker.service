@@ -1,0 +1,28 @@
+# /etc/systemd/system/vtt-aligner-worker.service
+[Unit]
+Description=vtt-aligner worker (narration -> WebVTT read-along timings)
+After=network.target
+
+[Service]
+Type=simple
+User=vtt-aligner
+Group=www-data
+UMask=0007
+Environment=VTT_ALIGNER_CONFIG=/opt/vtt-aligner/config.ini
+WorkingDirectory=/opt/vtt-aligner/worker
+ExecStart=/opt/vtt-aligner/venv/bin/python -u /opt/vtt-aligner/worker/worker.py
+Restart=on-failure
+RestartSec=5
+# Stop: the main process re-queues any job in progress, then exits.
+KillMode=mixed
+TimeoutStopSec=30
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/vtt-aligner
+Nice=5
+
+[Install]
+WantedBy=multi-user.target
