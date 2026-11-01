@@ -212,6 +212,35 @@ The theme menu and saved settings both read from that list, so nothing else need
 
 ---
 
-## Credits
+## License
 
-Built with [htmx](https://htmx.org/), [marked](https://marked.js.org/) and [DOMPurify](https://github.com/cure53/DOMPurify). Dyslexia-friendly font: [OpenDyslexic](https://opendyslexic.org/) (SIL Open Font License), served via [Fontsource](https://fontsource.org/). The VTT aligner uses [CMU PocketSphinx](https://github.com/cmusphinx/pocketsphinx), [espeak-ng](https://github.com/espeak-ng/espeak-ng) and [FFmpeg](https://ffmpeg.org/).
+md-reader, including the [vtt-aligner](utility/vtt-aligner/) utility, is released under the [MIT License](LICENSE).
+
+Third-party components keep their own licenses. None of them is included in this repository: the reader loads its libraries from public CDNs, and the aligner's tools are installed separately.
+
+### Third-party components: md-reader
+
+| Component | Used for | How it's used | License |
+|---|---|---|---|
+| [htmx](https://htmx.org/) 2.0.4 | Loading pages in place (no full reloads) | Loaded in the browser from the unpkg CDN, pinned with an integrity hash. Not included in this repository. | 0BSD |
+| [marked](https://marked.js.org/) 15.0.7 | Turning Markdown into HTML | Loaded in the browser from the jsDelivr CDN, pinned with an integrity hash. Not included. | MIT |
+| [DOMPurify](https://github.com/cure53/DOMPurify) 3.2.4 | Sanitising HTML from Markdown | Loaded in the browser from the jsDelivr CDN, pinned with an integrity hash. Not included. | MPL-2.0 or Apache-2.0 (your choice) |
+| [OpenDyslexic](https://opendyslexic.org/) font, via [Fontsource](https://fontsource.org/) 5.3.0 | The dyslexia-friendly font option | Font files loaded from the jsDelivr CDN, only when the toggle is switched on. Not included. | SIL OFL 1.1 |
+| Theme palettes: [Solarized](https://ethanschoonover.com/solarized/), [Nord](https://www.nordtheme.com/), [Dracula](https://draculatheme.com/), [Gruvbox](https://github.com/morhetz/gruvbox), [One Dark](https://github.com/atom/one-dark-syntax), [Catppuccin](https://catppuccin.com/), [Tokyo Night](https://github.com/enkia/tokyo-night-vscode-theme) | The named reading themes | Their colour values, re-implemented as CSS variables in `style.css` (a few text and link shades adjusted for contrast). No code copied. | MIT (each) |
+
+If you self-host the libraries or font instead of using the CDNs, keep their license files alongside them.
+
+### Third-party components: vtt-aligner
+
+| Component | Used for | How it's used | License |
+|---|---|---|---|
+| [CMU PocketSphinx](https://github.com/cmusphinx/pocketsphinx) 5.1, including its US English acoustic model and the CMU Pronouncing Dictionary | Speech recognition with word timings | Python package installed by `pip` (`worker/requirements.txt`) and imported. Not included in this repository. | BSD-2-Clause (bundled parts under BSD-style licenses) |
+| [NumPy](https://numpy.org/) | Audio analysis (finding pauses) | Python package installed by `pip` and imported. Not included. | BSD-3-Clause (bundled parts: 0BSD, MIT, Zlib, CC0-1.0) |
+| [markdown-it-py](https://github.com/executablebooks/markdown-it-py), with its dependency [mdurl](https://github.com/executablebooks/mdurl) | Reading Markdown into sentences | Python packages installed by `pip` and imported. Not included. | MIT |
+| [espeak-ng](https://github.com/espeak-ng/espeak-ng) | Pronunciations for names and unusual words | System package installed by `apt`, run as a separate program. Not included. | GPL-3.0-or-later |
+| [FFmpeg](https://ffmpeg.org/) | Decoding uploaded audio | System package installed by `apt`, run as a separate program. Not included. | LGPL-2.1-or-later; Debian/Ubuntu builds are GPL-2.0-or-later |
+| sounddevice, cffi, pycparser | Nothing (installed automatically as PocketSphinx dependencies) | Python packages pulled in by `pip`; the aligner doesn't use them. | MIT, MIT, BSD-3-Clause |
+
+No third-party code is copied into this repository. The GPL-licensed tools (espeak-ng, FFmpeg) are installed separately and run as separate programs, so their licenses don't extend to this project's code. If you distribute a bundle that *includes* them, such as a Docker image, follow their licenses for those parts (for example, by making their source available).
+
+The software these run on (PHP, Python, nginx or Apache) is not part of either project.
