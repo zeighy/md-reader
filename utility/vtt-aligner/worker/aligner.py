@@ -35,7 +35,7 @@ import unicodedata
 import wave
 from collections import Counter, defaultdict
 from functools import lru_cache
-from multiprocessing import Pool
+import multiprocessing
 
 import numpy as np
 from markdown_it import MarkdownIt
@@ -189,13 +189,30 @@ def to_wav16k(src, dst):
         raise AlignError("the audio file could not be decoded")
 
 
-def find_pauses(x, sr):
+def frame_db(x, sr):
+    """Loudness (dBFS) of each 10 ms frame."""
     hop = sr // 100
     n = len(x) // hop
     if n == 0:
         raise AlignError("the audio is empty")
     rms = np.sqrt((x[:n * hop].reshape(n, hop).astype(np.float32) ** 2).mean(axis=1) + 1e-9)
-    db = 20 * np.log10(rms / 32768 + 1e-12)
+    return 20 * np.log10(rms / 32768 + 1e-12)
+
+
+def quietest_point(db, lo, hi):
+    """Time (s) of the quietest ~50 ms in [lo, hi]: the gap between words, even
+    under music or background noise that hides real pauses."""
+    a, b = max(0, int(lo * 100)), min(len(db), int(hi * 100))
+    if b - a < 5:
+        return hi
+    seg = np.convolve(db[a:b], np.ones(5) / 5, mode="valid")  # seg[k] centres on frame a+k+2
+    return (a + int(np.argmin(seg)) + 2) / 100
+
+
+def find_pauses(x, sr, db=None):
+    if db is None:
+        db = frame_db(x, sr)
+    n = len(db)
     quiet = db < np.percentile(db, 90) - 30
     pauses, i = [], 0
     while i < n:
@@ -216,23 +233,29 @@ def find_pauses(x, sr):
 # ---------------------------------------------------------------------------
 
 _DEC = None
-_AUDIO = None
+_WAV = None
 _SR = 16000
 
 
 def _init(lm, dic, wav_path):
-    global _DEC, _AUDIO
+    global _DEC, _WAV
     import signal
     signal.signal(signal.SIGTERM, signal.SIG_DFL)  # only the main worker handles shutdown
     _DEC = Decoder(samprate=_SR, lm=lm, dict=dic, logfn=os.devnull)
-    w = wave.open(wav_path)
-    _AUDIO = w.readframes(w.getnframes())
+    _WAV = wav_path
 
 
 def _decode(span):
     s, e = span
+    start_frame = max(0, int(s * _SR))
+    end_frame = max(start_frame, int(e * _SR))
+    with wave.open(_WAV, "rb") as w:
+        w.setpos(min(start_frame, w.getnframes()))
+        raw = w.readframes(end_frame - start_frame)
+    if not raw:
+        return []
     _DEC.start_utt()
-    _DEC.process_raw(_AUDIO[int(s * _SR) * 2:int(e * _SR) * 2], full_utt=True)
+    _DEC.process_raw(raw, full_utt=True)
     _DEC.end_utt()
     out = []
     for seg in _DEC.seg():
@@ -290,20 +313,37 @@ def align_words(P, A, band=200):
         return -1.0
 
     # Coarse diagonal from long exact runs keeps the band on track even across
-    # long unread passages.
+    # long unread passages or unscripted intros/interludes.
     sm = difflib.SequenceMatcher(None, P, A, autojunk=False)
-    pts = [(0, 0)] + [(b.a + k, b.b + k) for b in sm.get_matching_blocks() if b.size >= 3 for k in range(b.size)] + [(n, m)]
-    xs = np.array([p[0] for p in pts], dtype=float)
-    ys = np.array([p[1] for p in pts], dtype=float)
-    centre = np.interp(np.arange(n + 1), xs, ys).astype(int)
-    lo = [max(0, int(c) - band) for c in centre]
-    hi = [min(m, int(c) + band) for c in centre]
+    lo_anc = {0: 0, n: m}
+    hi_anc = {0: 0, n: m}
+    for b in sm.get_matching_blocks():
+        if b.size >= 3:
+            for k in range(b.size):
+                for x, y in ((b.a + k, b.b + k), (b.a + k + 1, b.b + k + 1)):
+                    lo_anc[x] = min(lo_anc[x], y) if x in lo_anc else y
+                    hi_anc[x] = max(hi_anc[x], y) if x in hi_anc else y
+    lo_pts = sorted(lo_anc.items())
+    hi_pts = sorted(hi_anc.items())
+    grid = np.arange(n + 1)
+    lo_c = np.interp(grid, np.array([p[0] for p in lo_pts], dtype=float),
+                     np.array([p[1] for p in lo_pts], dtype=float)).astype(int)
+    hi_c = np.interp(grid, np.array([p[0] for p in hi_pts], dtype=float),
+                     np.array([p[1] for p in hi_pts], dtype=float)).astype(int)
+    lo = [max(0, int(c) - band) for c in lo_c]
+    hi = [min(m, int(c) + band) for c in hi_c]
+    lo[0] = 0
+    hi[n] = m
+    for i in range(1, n + 1):
+        if lo[i] > hi[i - 1] + 1:
+            lo[i] = hi[i - 1] + 1
+        if hi[i] < lo[i - 1]:
+            hi[i] = lo[i - 1]
     GAP, NEG = -0.8, -1e18
     prev = [NEG] * (hi[0] - lo[0] + 1)
-    prev[0 - lo[0]] = 0.0 if lo[0] == 0 else NEG
-    for j in range(lo[0] + 1, hi[0] + 1):
-        if prev[j - 1 - lo[0]] > NEG / 2:
-            prev[j - lo[0]] = prev[j - 1 - lo[0]] + GAP
+    prev[0] = 0.0
+    for j in range(1, hi[0] + 1):
+        prev[j] = prev[j - 1] + GAP
     trace = [bytes(len(prev))]
     for i in range(1, n + 1):
         L, H = lo[i], hi[i]
@@ -365,6 +405,68 @@ def place_cues(sents, page_words, owner, asr, pauses, dur, drop_unread=True):
     onset = np.interp(np.arange(len(page_words)), ai, at)
     anchored = set(ai.tolist())
     anchored_end = {a[0]: a[2] for a in anchors}
+    # Narrator's pace (seconds per word), from neighbouring heard words.
+    steps = [at[k + 1] - at[k] for k in range(len(ai) - 1) if ai[k + 1] - ai[k] == 1]
+    spw = float(np.clip(np.median(steps), 0.15, 1.0)) if steps else 0.35
+
+    heard_as = dict(pairs)  # page word -> index into asr
+    pause_starts = [a for a, _ in pauses]
+
+    def first_word_time(idx):
+        """When the sentence's first word was (probably) said.
+
+        Unscripted audio (an announcement, a side change) comes out of the
+        recogniser as stray words from the book itself, so a short opening word
+        like "the" can match a stray copy seconds before the sentence starts.
+        A real match is followed by the rest of the sentence; a stray one is
+        followed by a run of extra heard words before the next match (or, for a
+        short word, by an extra word and a silence no sentence has between
+        neighbouring words), so such leading matches are set aside. A narrator's dramatic pause after the
+        first word adds silence but no words, so it is kept. Then, if the first word wasn't heard,
+        count back from the first trusted match at the narrator's pace, rather
+        than interpolating from the previous sentence across the stray audio."""
+        fw = idx[0]
+        hits = [k for k in idx if k in anchored]
+        # Look for that break after the first or second match (strays can come
+        # in pairs, "the ... was"), and only set aside the smaller side.
+        cut = 0
+        for j in range(min(2, len(hits) - 1)):
+            a, b = hits[j], hits[j + 1]
+            extra = (heard_as[b] - heard_as[a] - 1) - (b - a - 1)  # heard words with no page word to explain them
+            gap = asr[heard_as[b]][1] - asr[heard_as[a]][2] - (b - a - 1) * spw
+            # The weaker sign (one extra word and a silence) only counts against
+            # short common words, the ones that recur nearby: noise can add a
+            # word to a narrator's pause, but rarely right after "Mara".
+            if (extra >= 3 or (extra >= 1 and gap > 0.6 and len(page_words[a]) <= 3)) \
+                    and len(hits) - (j + 1) >= j + 1:
+                cut = j + 1
+        hits = hits[cut:]
+        if not hits:
+            return float(onset[fw])
+        first = hits[0]
+        if first == fw:
+            return float(onset[fw])
+        prior = np.searchsorted(ai, fw) - 1  # last heard word before this sentence
+        floor = anchored_end[int(ai[prior])] if prior >= 0 else 0.0
+        return max(floor, count_back(float(onset[first]), first - fw))
+
+    def count_back(t, n_words):
+        """Step back from time t over n_words of speech at the narrator's pace,
+        skipping silences (a dramatic pause holds no words). Sentences start at
+        pauses, so stop at a pause once the speech after it accounts for all but
+        about one of the words (and for some of them, so that a pause straight
+        after an unheard first word isn't taken for the sentence's start)."""
+        need, got, pos = n_words * spw, 0.0, t
+        for k in range(bisect.bisect_left(pause_starts, pos) - 1, -1, -1):
+            a, b = pauses[k]
+            seg = max(0.0, pos - b)
+            if got + seg >= need:
+                return pos - (need - got)
+            got += seg
+            if need - got <= spw and got >= 0.3 * need:
+                return b
+            pos = a
+        return max(0.0, pos - (need - got))
 
     by_sent = defaultdict(list)
     for k, s in enumerate(owner):
@@ -391,8 +493,7 @@ def place_cues(sents, page_words, owner, asr, pauses, dur, drop_unread=True):
     starts, how = [], []
     prev_idx = None
     for n_, i in enumerate(keep):
-        fw = by_sent[i][0]
-        t = float(onset[fw])
+        t = first_word_time(by_sent[i])
         best = next(((a, b) for a, b in pauses if a - 0.1 <= t <= b + 0.1), None)
         tag = "pause"
         if best is None:
@@ -404,7 +505,9 @@ def place_cues(sents, page_words, owner, asr, pauses, dur, drop_unread=True):
             prev_end = anchored_end[prev_anchored[-1]] if prev_anchored else t - 2
             cands = [(a, b) for a, b in pauses if a >= prev_end - 0.15 and a < t + 0.4 and b - a >= 0.25]
             if cands:
-                best, tag = max(cands, key=lambda p: p[1] - p[0]), "pause*"
+                # Nearest to the estimated start, with a nudge towards longer pauses.
+                best = min(cands, key=lambda p: abs(p[1] - t) - 0.25 * min(p[1] - p[0], 2.0))
+                tag = "pause*"
         if n_ == 0 and best is not None and best[0] <= 0.05:
             starts.append(0.0); how.append("start")
         elif best:
@@ -438,10 +541,11 @@ def place_cues(sents, page_words, owner, asr, pauses, dur, drop_unread=True):
                 how[r] = "pause+"
         k = j + 1
 
+    starts = [min(round(max(0.0, s), 3), round(dur, 3)) for s in starts]
     cues = []
     for n_, i in enumerate(keep):
-        end = starts[n_ + 1] if n_ + 1 < len(keep) else dur
-        cues.append({"start": starts[n_], "end": round(end, 3), "text": sents[i]["text"], "how": how[n_]})
+        end = starts[n_ + 1] if n_ + 1 < len(keep) else round(dur, 3)
+        cues.append({"start": starts[n_], "end": max(starts[n_], round(end, 3)), "text": sents[i]["text"], "how": how[n_]})
 
     first3 = sum(1 for i in keep if any(k in anchored for k in by_sent[i][:3]))
     stats = {
@@ -478,11 +582,16 @@ def to_vtt(cues, title=None):
     def ts(t):
         t = max(0.0, t)
         return f"{int(t // 3600):02d}:{int(t % 3600 // 60):02d}:{t % 60:06.3f}"
-    out = ["WEBVTT", "", "NOTE", f"Sentence timings for read-along{(': ' + title) if title else ''}.",
+
+    def esc(s):
+        return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                 .replace("\r", " ").replace("\n", " "))
+
+    clean_title = title.replace("-->", "->").replace("\r", " ").replace("\n", " ") if title else None
+    out = ["WEBVTT", "", "NOTE", f"Sentence timings for read-along{(': ' + clean_title) if clean_title else ''}.",
            f"Generated by vtt-aligner {VERSION}; one cue per sentence.", ""]
     for i, c in enumerate(cues, 1):
-        text = c["text"].replace("-->", "->").replace("\n", " ")
-        out += [str(i), f"{ts(c['start'])} --> {ts(c['end'])}", text, ""]
+        out += [str(i), f"{ts(c['start'])} --> {ts(c['end'])}", esc(c["text"]), ""]
     return "\n".join(out)
 
 
@@ -491,12 +600,12 @@ def to_vtt(cues, title=None):
 # ---------------------------------------------------------------------------
 
 def run(audio_path, text, fmt="markdown", pronunciations="", drop_unread=True, cores=0,
-        max_minutes=240, progress=None, title=None):
+        max_minutes=240, progress=None, title=None, tmp_dir=None):
     """Align and return (vtt_text, report). Raises AlignError for bad input."""
     t0 = time.time()
     say = progress or (lambda stage, pct=None: None)
     cores = cores or max(1, os.cpu_count() or 1)
-    work = tempfile.mkdtemp(prefix="vtt-aligner-")
+    work = tempfile.mkdtemp(prefix="vtt-aligner-", dir=tmp_dir)
     try:
         say("preparing text")
         text = text.lstrip("﻿")
@@ -513,11 +622,12 @@ def run(audio_path, text, fmt="markdown", pronunciations="", drop_unread=True, c
         say("decoding audio")
         wav = os.path.join(work, "a16k.wav")
         to_wav16k(audio_path, wav)
-        w = wave.open(wav)
-        x = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
+        with wave.open(wav, "rb") as w:
+            x = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
         if len(x) / _SR > max_minutes * 60:
             raise AlignError(f"the audio is longer than the {max_minutes}-minute limit")
-        pauses, dur = find_pauses(x, _SR)
+        db = frame_db(x, _SR)
+        pauses, dur = find_pauses(x, _SR, db)
         del x
 
         say("building vocabulary")
@@ -546,22 +656,45 @@ def run(audio_path, text, fmt="markdown", pronunciations="", drop_unread=True, c
                     f.write(f"{wd} {ph}\n")
         vocab = known | set(extra)
         lm = os.path.join(work, "text.lm")
-        build_lm([[t for t in ts if t in vocab] for ts in toks], lm)
+        lm_sents = [[t for t in ts if t in vocab] for ts in toks]
+        if not any(lm_sents):
+            raise AlignError("none of the words in the text could be matched to a pronunciation")
+        build_lm(lm_sents, lm)
 
-        # chunks of <= ~30 s cut in the middle of pauses
+        # Chunks of ~18-60 s cut in the middle of pauses. Where no pause turns up
+        # for 60 s (narration over music or noise), cut at the quietest moment
+        # 30-60 s in, so a cut lands between words rather than through one.
         cuts, last = [0.0], 0.0
         for a, b in pauses:
             mid = (a + b) / 2
-            if b - a >= 0.4 and mid - last >= 18:
+            while mid - last > 60:
+                last = quietest_point(db, last + 30, last + 60)
+                cuts.append(last)
+            if (b - a >= 0.4 and mid - last >= 18) or (mid - last >= 45):
                 cuts.append(mid)
                 last = mid
-        cuts.append(dur)
+        while dur - last > 60:
+            last = quietest_point(db, last + 30, last + 60)
+            cuts.append(last)
+        if dur > last:
+            cuts.append(dur)
         chunks = list(zip(cuts[:-1], cuts[1:]))
         asr = []
-        with Pool(cores, initializer=_init, initargs=(lm, dic, wav)) as pool:
+        # Start each recogniser as a fresh interpreter, never by fork(): the
+        # worker runs a heartbeat thread and numpy starts its own threads (even
+        # in a forkserver), and forking a threaded process can deadlock children.
+        ctx = multiprocessing.get_context("spawn")
+        pool = ctx.Pool(min(cores, max(1, len(chunks))), initializer=_init, initargs=(lm, dic, wav))
+        try:
             for n, res in enumerate(pool.imap(_decode, chunks), 1):
                 asr.extend(res)
                 say("transcribing", round(100 * n / len(chunks)))
+            pool.close()
+        except BaseException:
+            pool.terminate()
+            raise
+        finally:
+            pool.join()
 
         say("aligning")
         cues, stats = place_cues(sents, page_words, owner, asr, pauses, dur, drop_unread)
@@ -590,12 +723,20 @@ if __name__ == "__main__":
     ap.add_argument("--report", help="write a JSON report here")
     a = ap.parse_args()
     fmt = a.format or ("text" if a.text.lower().endswith(".txt") else "markdown")
-    pron = open(a.pronunciations, encoding="utf-8").read() if a.pronunciations else ""
-    vtt, rep = run(a.audio, open(a.text, encoding="utf-8").read(), fmt, pron, not a.keep_unread,
+    if a.pronunciations:
+        with open(a.pronunciations, encoding="utf-8") as f:
+            pron = f.read()
+    else:
+        pron = ""
+    with open(a.text, encoding="utf-8") as f:
+        text_in = f.read()
+    vtt, rep = run(a.audio, text_in, fmt, pron, not a.keep_unread,
                    progress=lambda s, p=None: print(f"  {s}{'' if p is None else f' {p}%'}", flush=True))
     out = a.output or os.path.splitext(a.audio)[0] + ".vtt"
-    open(out, "w", encoding="utf-8").write(vtt)
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(vtt)
     if a.report:
-        json.dump(rep, open(a.report, "w"), indent=2, ensure_ascii=False)
+        with open(a.report, "w", encoding="utf-8") as f:
+            json.dump(rep, f, indent=2, ensure_ascii=False)
     print(f"wrote {out}: {rep['cues']} cues; {rep['words_matched_pct']}% words matched; "
           f"median match {rep['quality']['median_match']}; flagged {len(rep['quality']['flagged'])}")

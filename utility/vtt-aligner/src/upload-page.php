@@ -102,7 +102,7 @@ $e = fn($s) => htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8');
     <div class="field">
       <span class="label" id="audio-label">Narration audio</span>
       <label class="drop" id="audio-drop">
-        <input type="file" id="audio" accept="audio/*,.mp3,.m4a,.wav,.ogg,.opus,.flac,.webm" aria-labelledby="audio-label">
+        <input type="file" id="audio" accept="audio/*,.mp3,.m4a,.aac,.wav,.ogg,.opus,.flac,.webm" aria-labelledby="audio-label">
         <span class="icon" aria-hidden="true">♪</span>
         <span class="what"><span class="name">Choose an MP3 (or drop it here)</span>
         <span class="sub">MP3, M4A, WAV, OGG/Opus, FLAC · up to <?= $e($cfg['max_upload_mb']) ?> MB</span></span>
@@ -178,11 +178,13 @@ $e = fn($s) => htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8');
 
   // ---- picking files (click or drop) ----------------------------------
   function bindDrop(drop, input, emptyText) {
+    var subEl = drop.querySelector('.sub');
+    var emptySub = subEl.textContent;
     function show() {
       var f = input.files[0];
       drop.classList.toggle('has', !!f);
       drop.querySelector('.name').textContent = f ? f.name : emptyText;
-      if (f) drop.querySelector('.sub').textContent = size(f.size);
+      subEl.textContent = f ? size(f.size) : emptySub;
       ready();
     }
     input.addEventListener('change', show);

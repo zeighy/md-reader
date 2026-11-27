@@ -18,9 +18,11 @@ import configparser
 import fcntl
 import json
 import os
+import re
 import shutil
 import signal
 import sys
+import threading
 import time
 import traceback
 
@@ -29,6 +31,7 @@ sys.path.insert(0, HERE)
 import aligner  # noqa: E402
 
 CONFIG = os.environ.get("VTT_ALIGNER_CONFIG", os.path.join(os.path.dirname(HERE), "config.ini"))
+ID_RE = re.compile(r"^[a-f0-9]{32}$")
 
 
 def load_config():
@@ -53,7 +56,7 @@ def now():
 
 
 def write_json(path, data):
-    tmp = f"{path}.tmp{os.getpid()}"
+    tmp = f"{path}.tmp{os.getpid()}.{threading.get_ident()}"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=1)
     os.replace(tmp, path)
@@ -96,6 +99,8 @@ def heartbeat(cfg, state):
 def queued_jobs(jobs_dir):
     out = []
     for name in os.listdir(jobs_dir):
+        if not ID_RE.match(name):
+            continue
         st = read_json(os.path.join(jobs_dir, name, "status.json"))
         if st and st.get("status") == "queued":
             out.append((st.get("created_at", ""), name))
@@ -105,6 +110,8 @@ def queued_jobs(jobs_dir):
 def recover_stale(jobs_dir):
     """A job left 'running' whose lock nobody holds was interrupted: queue it again."""
     for name in os.listdir(jobs_dir):
+        if not ID_RE.match(name):
+            continue
         d = os.path.join(jobs_dir, name)
         st = read_json(os.path.join(d, "status.json"))
         if not st or st.get("status") != "running":
@@ -127,6 +134,8 @@ def housekeeping(cfg, jobs_dir):
                 if os.path.getmtime(d) < time.time() - 3600:
                     shutil.rmtree(d, ignore_errors=True)
                 continue
+            if not ID_RE.match(name):
+                continue
             st = read_json(os.path.join(d, "status.json"), {})
             if st.get("status") in ("done", "failed") and os.path.getmtime(os.path.join(d, "status.json")) < cutoff:
                 with open(os.path.join(d, "job.lock"), "a") as lk:
@@ -134,6 +143,15 @@ def housekeeping(cfg, jobs_dir):
                     shutil.rmtree(d, ignore_errors=True)
         except OSError:
             pass
+    tmp_dir = os.path.join(cfg["storage"], "tmp")
+    if os.path.isdir(tmp_dir):
+        for name in os.listdir(tmp_dir):
+            p = os.path.join(tmp_dir, name)
+            try:
+                if name.startswith("vtt-aligner-") and os.path.getmtime(p) < time.time() - 3600:
+                    shutil.rmtree(p, ignore_errors=True)
+            except OSError:
+                pass
 
 
 def process(cfg, d):
@@ -143,6 +161,7 @@ def process(cfg, d):
         return
     opts = read_json(os.path.join(d, "options.json"), {})
     audio = next((os.path.join(d, f) for f in os.listdir(d) if f.startswith("audio.")), None)
+    job_id = os.path.basename(d)
     st.update(status="running", started_at=now(), progress={"stage": "starting"}, error=None)
     write_json(status_path, st)
     last = [0.0]
@@ -153,11 +172,27 @@ def process(cfg, d):
         last[0] = time.time()
         st["progress"] = {"stage": stage, **({"percent": pct} if pct is not None else {})}
         write_json(status_path, st)
-        heartbeat(cfg, f"working on {os.path.basename(d)}")
+        heartbeat(cfg, f"working on {job_id}")
+
+    # Keep worker.json fresh during long stages (ffmpeg decode, espeak, alignment)
+    # so /v1/health never reports a busy worker as dead.
+    done_hb = threading.Event()
+
+    def keep_alive():
+        while not done_hb.wait(10):
+            try:
+                heartbeat(cfg, f"working on {job_id}")
+            except OSError:
+                pass
+
+    tmp_dir = os.path.join(cfg["storage"], "tmp")
+    hb_thread = threading.Thread(target=keep_alive, daemon=True)
 
     signal.signal(signal.SIGALRM, on_alarm)
     signal.alarm(cfg["max_job_minutes"] * 60)
     try:
+        hb_thread.start()
+        os.makedirs(tmp_dir, exist_ok=True)
         if not audio:
             raise aligner.AlignError("no audio file in job")
         with open(os.path.join(d, "text.txt"), encoding="utf-8") as f:
@@ -165,7 +200,8 @@ def process(cfg, d):
         vtt, report = aligner.run(
             audio, text, fmt=opts.get("format", "markdown"), pronunciations=opts.get("pronunciations", ""),
             drop_unread=opts.get("drop_unread", True), cores=cfg["cores"],
-            max_minutes=cfg["max_audio_minutes"], progress=progress, title=opts.get("name") or None)
+            max_minutes=cfg["max_audio_minutes"], progress=progress, title=opts.get("name") or None,
+            tmp_dir=tmp_dir)
         with open(os.path.join(d, "result.vtt.tmp"), "w", encoding="utf-8") as f:
             f.write(vtt)
         os.replace(os.path.join(d, "result.vtt.tmp"), os.path.join(d, "result.vtt"))
@@ -183,15 +219,19 @@ def process(cfg, d):
         st.update(status="failed", finished_at=now(), error="internal error while aligning (see worker log)")
     finally:
         signal.alarm(0)
+        done_hb.set()
+        if hb_thread.is_alive():
+            hb_thread.join(timeout=2)
     if not cfg["keep_inputs"] and audio and st["status"] in ("done", "failed"):
         try:
             os.remove(audio)
         except OSError:
             pass
     write_json(status_path, st)
-    print(f"{now()} job {os.path.basename(d)}: {st['status']}"
-          + (f" ({st['error']})" if st.get("error") else f" ({st['report']['cues']} cues, {st['report']['processing_seconds']}s)"),
-          flush=True)
+    detail = (f" ({st['report']['cues']} cues, {st['report']['processing_seconds']}s)"
+              if st["status"] == "done" and st.get("report")
+              else f" ({st.get('error') or 'failed'})")
+    print(f"{now()} job {job_id}: {st['status']}{detail}", flush=True)
 
 
 def main():

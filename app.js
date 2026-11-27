@@ -92,7 +92,7 @@
   });
 
   // IDs the app itself relies on; document content must never reuse them.
-  var APP_IDS = {};
+  var APP_IDS = Object.create(null);
   document.querySelectorAll('[id]').forEach(function (el) {
     if (!el.closest('#content') || el.id === 'content') APP_IDS[el.id] = true;
   });
@@ -111,8 +111,14 @@
   // Resolve a link written inside a markdown file against that file's folder.
   // A leading "/" means the root of the docs folder.
   function resolve(baseDir, ref) {
-    var u = new URL(ref, 'http://docs/' + (baseDir ? baseDir + '/' : ''));
-    return { path: decodeURIComponent(u.pathname.slice(1)), hash: u.hash };
+    try {
+      var u = new URL(ref, 'http://docs/' + (baseDir ? encPath(baseDir) + '/' : ''));
+      var raw = u.pathname.slice(1), path;
+      try { path = decodeURIComponent(raw); } catch (e) { path = raw; }
+      return { path: path, hash: u.hash };
+    } catch (e) {
+      return null;
+    }
   }
 
   function slugify(text) {
@@ -122,7 +128,7 @@
   }
 
   // Renders the main document and the header.md / footer.md blocks alike.
-  function renderDoc(article) {
+  function renderDoc(article, taken) {
     var src = article.querySelector('textarea.md-src');
     if (!src) return; // already rendered (e.g. restored from history)
     var isMain = article.matches('article.doc');
@@ -135,7 +141,7 @@
 
     // Keep IDs unique and clear of the app's own (prevents DOM clobbering),
     // and give headings anchors so #section links work.
-    var taken = {};
+    taken = taken || Object.create(null);
     body.querySelectorAll('[id]').forEach(function (el) { el.id = uniqueId(el.id, taken); });
     body.querySelectorAll('h1, h2, h3, h4, h5, h6').forEach(function (h) {
       if (!h.id) h.id = uniqueId(slugify(h.textContent) || 'section', taken);
@@ -143,11 +149,12 @@
 
     // Images: relative paths are served through the PHP asset endpoint.
     body.querySelectorAll('img[src]').forEach(function (img) {
-      var ref = img.getAttribute('src');
+      var ref = (img.getAttribute('src') || '').trim();
       img.loading = 'lazy';
       img.decoding = 'async';
-      if (!EXTERNAL.test(ref)) {
-        img.src = 'api.php?action=asset&file=' + encPath(resolve(baseDir, ref).path);
+      if (ref && !EXTERNAL.test(ref)) {
+        var r = resolve(baseDir, ref);
+        if (r) img.src = 'api.php?action=asset&file=' + encPath(r.path);
       }
       // Images that aren't links open in the lightbox.
       if (!img.closest('a')) {
@@ -160,13 +167,14 @@
 
     // Links: other .md files open in the viewer; external links open in a new tab.
     body.querySelectorAll('a[href]').forEach(function (a) {
-      var ref = a.getAttribute('href');
-      if (ref.charAt(0) === '#') return;
+      var ref = (a.getAttribute('href') || '').trim();
+      if (!ref || ref.charAt(0) === '#') return;
       if (EXTERNAL.test(ref)) {
         if (/^https?:|^\/\//i.test(ref)) { a.target = '_blank'; a.rel = 'noopener noreferrer'; }
         return;
       }
       var r = resolve(baseDir, ref);
+      if (!r) return;
       if (MD_FILE.test(r.path)) {
         var page = '?file=' + encPath(r.path) + r.hash;
         a.setAttribute('href', page);
@@ -189,31 +197,32 @@
   // #section scroll, and telling the audio player which page this is.
   // Runs after a fresh render and after Back/Forward restores a page.
   function pageShown(article) {
-    var file = article.getAttribute('data-file') || '';
+    var isNotice = article.classList.contains('notice');
+    var file = isNotice ? '' : (article.getAttribute('data-file') || '');
     var body = article.querySelector('.md-body');
 
     // Page title from the first heading.
-    var h1 = body && body.querySelector('h1');
+    var h1 = (body || article).querySelector('h1');
     var site = document.body.getAttribute('data-site-title');
     document.title = h1 ? h1.textContent + ' · ' + site : site;
     $('topbar-title').textContent = h1 ? h1.textContent : site;
 
     // Highlight the open file in the sidebar.
     document.querySelectorAll('#tree a[data-file]').forEach(function (a) {
-      var on = a.getAttribute('data-file') === file;
+      var on = file !== '' && a.getAttribute('data-file') === file;
       a.classList.toggle('active', on);
       if (on) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
     });
 
     // Open only the folders that lead to this document; collapse the rest.
     document.querySelectorAll('#tree details[data-dir]').forEach(function (d) {
-      d.open = file.indexOf(d.getAttribute('data-dir') + '/') === 0;
+      d.open = file !== '' && file.indexOf(d.getAttribute('data-dir') + '/') === 0;
     });
 
     // Honour #section in the URL (after htmx finishes its own scroll-to-top).
-    setTimeout(scrollToHash, 30);
+    if (!isNotice) setTimeout(scrollToHash, 30);
 
-    document.dispatchEvent(new CustomEvent('mdv:page', { detail: { article: article } }));
+    document.dispatchEvent(new CustomEvent('mdv:page', { detail: { article: isNotice ? null : article } }));
   }
 
   // Back/Forward put back an already-rendered document (only #content is
@@ -226,7 +235,9 @@
 
   function scrollToHash() {
     if (!location.hash) return;
-    var target = document.getElementById(decodeURIComponent(location.hash.slice(1)));
+    var id;
+    try { id = decodeURIComponent(location.hash.slice(1)); } catch (e) { return; }
+    var target = document.getElementById(id);
     if (target) target.scrollIntoView();
   }
   // htmx files each page's Back/Forward snapshot under the URL it pushed, but
@@ -251,11 +262,11 @@
 
   htmx.onLoad(function (elt) {
     var docs = elt.matches && elt.matches('[data-md]') ? [elt] : elt.querySelectorAll('[data-md]');
-    Array.prototype.forEach.call(docs, renderDoc);
+    var taken = Object.create(null);
+    Array.prototype.forEach.call(docs, function (d) { renderDoc(d, taken); });
     // "Not found" and similar notices are pages too (with no audio).
-    if (elt.querySelector && elt.querySelector('article.notice')) {
-      document.dispatchEvent(new CustomEvent('mdv:page', { detail: { article: null } }));
-    }
+    var notice = elt.matches && elt.matches('article.notice') ? elt : (elt.querySelector && elt.querySelector('article.notice'));
+    if (notice) pageShown(notice);
   });
 
   document.body.addEventListener('htmx:afterSwap', function (e) {
@@ -329,6 +340,7 @@
   });
 
   lb.addEventListener('keydown', function (e) {
+    if (gallery.length < 2) return;
     if (e.key === 'ArrowLeft') { e.preventDefault(); showImage(index - 1); }
     else if (e.key === 'ArrowRight') { e.preventDefault(); showImage(index + 1); }
   });

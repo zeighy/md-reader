@@ -520,6 +520,7 @@
   });
   seekBar.addEventListener('change', function () { dragging = false; following = true; });
   window.addEventListener('pointerup', function () { dragging = false; });
+  window.addEventListener('pointercancel', function () { dragging = false; });
 
   rateSel.addEventListener('change', function () {
     rate = parseFloat(rateSel.value) || 1;
