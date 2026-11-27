@@ -1,5 +1,11 @@
 # Apache: send every request to index.php.
 Options -Indexes
+
+# Block dotfiles (including .user.ini).
+<FilesMatch "^\.">
+    Require all denied
+</FilesMatch>
+
 RewriteEngine On
 RewriteCond %{REQUEST_FILENAME} !-f
 RewriteRule ^ index.php [QSA,L]

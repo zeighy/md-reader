@@ -24,7 +24,7 @@ const ID_RE = '/^[a-f0-9]{32}$/';
 const AUDIO_EXT = [
     'audio/mpeg' => 'mp3', 'audio/mp3' => 'mp3', 'audio/x-mpeg' => 'mp3',
     'audio/wav' => 'wav', 'audio/x-wav' => 'wav', 'audio/wave' => 'wav', 'audio/vnd.wave' => 'wav',
-    'audio/mp4' => 'm4a', 'audio/x-m4a' => 'm4a', 'audio/aac' => 'aac', 'audio/x-hx-aac-adts' => 'aac',
+    'audio/mp4' => 'm4a', 'audio/x-m4a' => 'm4a', 'audio/aac' => 'aac', 'audio/x-aac' => 'aac', 'audio/x-hx-aac-adts' => 'aac',
     'video/mp4' => 'm4a', 'audio/ogg' => 'ogg', 'application/ogg' => 'ogg', 'audio/opus' => 'opus',
     'audio/webm' => 'webm', 'video/webm' => 'webm', 'audio/flac' => 'flac', 'audio/x-flac' => 'flac',
 ];
@@ -100,11 +100,19 @@ function read_json_file(string $path): ?array
     return is_array($v) ? $v : null;
 }
 
-function write_json_file(string $path, array $data): void
+function write_json_file(string $path, array $data): bool
 {
     $tmp = $path . '.tmp' . getmypid();
-    file_put_contents($tmp, json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT));
-    rename($tmp, $path);
+    $json = json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
+    if ($json === false || @file_put_contents($tmp, $json) === false) {
+        @unlink($tmp);
+        return false;
+    }
+    if (!@rename($tmp, $path)) {
+        @unlink($tmp);
+        return false;
+    }
+    return true;
 }
 
 function rrmdir(string $dir): void
@@ -190,7 +198,7 @@ function require_method(string $method, array $allowed): void
 function health(): never
 {
     $hb = read_json_file(config()['storage'] . '/worker.json');
-    $age = $hb ? max(0, time() - (int)$hb['seen']) : null;
+    $age = ($hb && isset($hb['seen']) && is_numeric($hb['seen'])) ? max(0, time() - (int)$hb['seen']) : null;
     $alive = $age !== null && $age < 30 && ($hb['state'] ?? '') !== 'stopped';
     $q = queue_state();
     $c = config();
@@ -252,17 +260,21 @@ function create_job(): never
     // ---- options ----
     $format = $_POST['format'] ?? (preg_match('/\.txt$/i', $textName) ? 'text' : 'markdown');
     if (!in_array($format, ['markdown', 'text'], true)) fail(400, 'bad_option', 'format must be "markdown" or "text".');
-    $name = trim((string)($_POST['name'] ?? ''));
+    $rawName = $_POST['name'] ?? '';
+    if (!is_string($rawName)) fail(400, 'bad_option', 'name must be up to 200 printable characters.');
+    $name = trim($rawName);
     if (mb_strlen($name) > 200 || preg_match('/[\x00-\x1F\x7F]/', $name)) fail(400, 'bad_option', 'name must be up to 200 printable characters.');
-    $pron = (string)($_POST['pronunciations'] ?? '');
-    if (strlen($pron) > 65536 || !mb_check_encoding($pron, 'UTF-8')) fail(400, 'bad_option', 'pronunciations must be UTF-8, up to 64 KB.');
+    $pron = $_POST['pronunciations'] ?? '';
+    if (!is_string($pron) || strlen($pron) > 65536 || !mb_check_encoding($pron, 'UTF-8')) fail(400, 'bad_option', 'pronunciations must be UTF-8, up to 64 KB.');
     foreach (preg_split('/\R/', $pron) as $n => $line) {
         $line = trim(explode('#', $line, 2)[0]);
         if ($line !== '' && !preg_match("/^[A-Za-z0-9']+(\s+[A-Za-z]{1,2}[0-2]?)+$/", $line)) {
             fail(400, 'bad_option', 'pronunciations line ' . ($n + 1) . ': expected "word PHONES" (CMU/ARPAbet, e.g. "torvin T AO R V IH N").');
         }
     }
-    $dropUnread = !in_array(strtolower((string)($_POST['drop_unread'] ?? 'true')), ['0', 'false', 'no', 'off'], true);
+    $rawDrop = $_POST['drop_unread'] ?? 'true';
+    if (!is_string($rawDrop)) fail(400, 'bad_option', 'drop_unread must be true or false.');
+    $dropUnread = !in_array(strtolower($rawDrop), ['0', 'false', 'no', 'off'], true);
 
     // ---- capacity ----
     $q = queue_state();
@@ -278,18 +290,26 @@ function create_job(): never
     $id = bin2hex(random_bytes(16));
     $tmp = jobs_dir() . "/$id.tmp";
     if (!@mkdir($tmp, 02770)) fail(500, 'storage_unavailable', 'Could not create the job.');
-    if (!move_uploaded_file($f['tmp_name'], "$tmp/audio.$ext")) { rrmdir($tmp); fail(500, 'upload_failed', 'Could not store the audio.'); }
-    file_put_contents("$tmp/text.txt", $text);
-    write_json_file("$tmp/options.json", ['format' => $format, 'name' => $name, 'pronunciations' => $pron, 'drop_unread' => $dropUnread]);
+    // PHP creates upload temp files as 0600, which rename() preserves on the same filesystem;
+    // chmod to 0660 so the worker user (sharing the group) can read the audio.
+    if (!move_uploaded_file($f['tmp_name'], "$tmp/audio.$ext") || !@chmod("$tmp/audio.$ext", 0660)) {
+        rrmdir($tmp);
+        fail(500, 'upload_failed', 'Could not store the audio.');
+    }
     $st = [
         'id' => $id, 'status' => 'queued', 'name' => $name !== '' ? $name : null,
         'created_at' => gmdate('Y-m-d\TH:i:s\Z'), 'started_at' => null, 'finished_at' => null,
         'progress' => ['stage' => 'queued'], 'error' => null,
         'input' => ['audio_type' => $mime, 'audio_bytes' => (int)$f['size'], 'text_bytes' => strlen($text), 'format' => $format],
     ];
-    write_json_file("$tmp/status.json", $st);
-    touch("$tmp/job.lock");
-    if (!rename($tmp, jobs_dir() . "/$id")) { rrmdir($tmp); fail(500, 'storage_unavailable', 'Could not create the job.'); }
+    if (@file_put_contents("$tmp/text.txt", $text) === false
+        || !write_json_file("$tmp/options.json", ['format' => $format, 'name' => $name, 'pronunciations' => $pron, 'drop_unread' => $dropUnread])
+        || !write_json_file("$tmp/status.json", $st)
+        || !@touch("$tmp/job.lock")
+        || !@rename($tmp, jobs_dir() . "/$id")) {
+        rrmdir($tmp);
+        fail(500, 'storage_unavailable', 'Could not create the job.');
+    }
 
     send_json(202, status_body($id, $st), ['Location: ' . base_url() . "/jobs/$id"]);
 }
@@ -324,9 +344,10 @@ function delete_job(string $id): never
     if (!$lk || !flock($lk, LOCK_EX | LOCK_NB)) fail(409, 'busy', 'The job is being processed; delete it once it has finished.');
     // Move it aside first so the worker never sees a half-deleted job.
     $gone = jobs_dir() . "/$id.del-" . bin2hex(random_bytes(4));
-    rename($d, $gone);
+    $moved = @rename($d, $gone);
     flock($lk, LOCK_UN);
     fclose($lk);
+    if (!$moved) fail(500, 'storage_unavailable', 'Could not delete the job.');
     rrmdir($gone);
     http_response_code(204);
     exit;

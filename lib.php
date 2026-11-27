@@ -247,7 +247,7 @@ function default_file(array $cfg, string $root): ?string
     foreach (scandir($root) ?: [] as $f) {
         if (!is_partial($f) && safe_path($root, $f, MD_EXT)) return $f;
     }
-    return null;
+    return reading_order(doc_entries($root))[0] ?? null;
 }
 
 // Find header.md / footer.md at the top level (any letter case) and wrap it

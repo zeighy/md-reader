@@ -12,7 +12,7 @@
 
 /* ---- Themes ------------------------------------------------------------
    Each theme is just a set of variables. Add your own by copying a block,
-   giving it a new data-theme name, and adding an <option> in index.php. */
+   giving it a new data-theme name, and adding it to THEME_GROUPS in lib.php. */
 :root {
   --fs: 16px;            /* document text size, changed by the A− / A+ buttons */
   --leading: 1.65;
